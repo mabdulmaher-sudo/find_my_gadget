@@ -2,12 +2,30 @@ import os
 import re
 import math
 import time
+import json
+import shutil
+import subprocess
+import threading
+import sys
+from pathlib import Path
+from datetime import datetime
+
 import pandas as pd
-from flask import Flask, request, render_template_string, send_from_directory, url_for
+from flask import Flask, request, render_template_string, send_from_directory, url_for, jsonify
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(APP_DIR, "gadgets.csv")
 IMAGE_FOLDER = os.path.join(APP_DIR, "gadget_images")
+
+BASE_DIR = Path(APP_DIR)
+SCRAPER_PATH = BASE_DIR / "scrape_gadgets.py"
+LOG_DIR = BASE_DIR / "logs"
+OUTPUT_DIR = BASE_DIR / "outputs"
+LOCK_FILE = BASE_DIR / "scraper.lock"
+STATUS_FILE = BASE_DIR / "scraper_status.json"
+
+LOG_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
 
@@ -51,14 +69,6 @@ def money(value):
 
 
 def parse_budget_input(value):
-    """
-    Accepted input examples:
-    10000
-    10,000
-    ₱10,000
-    10k
-    10K
-    """
     text = clean_text(value).lower()
     text = text.replace("₱", "").replace(",", "").replace("php", "").strip()
 
@@ -77,14 +87,6 @@ def parse_budget_input(value):
 
 
 def get_budget_range(budget):
-    """
-    0.1% pababa and 5% pataas.
-
-    Example:
-    budget = 10000
-    lower = 9990
-    upper = 10500
-    """
     lower_limit = budget * 0.999
     upper_limit = budget * 1.05
 
@@ -257,10 +259,6 @@ def get_image(row):
 # =====================================================
 
 def build_category_guides(df):
-    """
-    Gumagawa ng price instruction based mismo sa gadgets.csv.
-    Lalabas ito sa UI kapag pinili ang gadget type.
-    """
     guides = {}
 
     if df.empty:
@@ -528,14 +526,6 @@ def usage_match_score(row, usage):
 
 
 def price_match_score(price, budget):
-    """
-    Only gives score if price is inside:
-    0.1% below budget to 5% above budget.
-
-    Example:
-    budget = 10000
-    accepted price = 9990 to 10500
-    """
     if not budget or budget <= 0:
         return 0.0
 
@@ -644,9 +634,6 @@ def load_data():
 # =====================================================
 # AUTO-RELOAD DATASET FOR N8N UPDATES
 # =====================================================
-# n8n updates gadgets.csv through scrape_gadgets.py.
-# This cache reloads the dataset automatically whenever gadgets.csv changes,
-# so you do not need to restart app.py after every n8n run.
 
 DATA_CACHE = None
 DATA_MTIME = None
@@ -685,6 +672,138 @@ def get_category_guides():
         get_data(force_reload=True)
 
     return CATEGORY_GUIDES_CACHE or build_category_guides(pd.DataFrame())
+
+
+# =====================================================
+# ONLINE N8N PUBLIC API ROUTES
+# =====================================================
+
+def write_scraper_status(status, message, log_file="", started_at="", finished_at="", return_code=None):
+    data = {
+        "status": status,
+        "message": message,
+        "log_file": str(log_file) if log_file else "",
+        "started_at": str(started_at) if started_at else "",
+        "finished_at": str(finished_at) if finished_at else "",
+        "return_code": return_code,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    STATUS_FILE.write_text(
+        json.dumps(data, indent=4, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+
+def read_scraper_status():
+    if not STATUS_FILE.exists():
+        return {
+            "status": "idle",
+            "message": "No scraper run yet.",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    try:
+        return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "status": "unknown",
+            "message": "Could not read scraper status."
+        }
+
+
+def copy_latest_clean_csv_to_gadgets():
+    latest_files = []
+    latest_files += list(BASE_DIR.glob("find_my_gadget_CLEAN_*.csv"))
+    latest_files += list(OUTPUT_DIR.glob("find_my_gadget_CLEAN_*.csv"))
+    latest_files += list(OUTPUT_DIR.glob("find_my_gadget_latest.csv"))
+
+    if not latest_files:
+        return False
+
+    latest_file = max(latest_files, key=lambda file: file.stat().st_mtime)
+    shutil.copyfile(latest_file, DATA_FILE)
+    return True
+
+
+def run_scraper_background():
+    started_at = datetime.now()
+    timestamp = started_at.strftime("%Y%m%d_%H%M%S")
+    log_file = LOG_DIR / f"online_scraper_{timestamp}.log"
+
+    try:
+        LOCK_FILE.write_text("running", encoding="utf-8")
+
+        write_scraper_status(
+            status="running",
+            message="Scraper is running in the background.",
+            log_file=log_file,
+            started_at=started_at
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(SCRAPER_PATH)],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace"
+        )
+
+        finished_at = datetime.now()
+
+        log_text = ""
+        log_text += f"Started: {started_at}\n"
+        log_text += f"Finished: {finished_at}\n"
+        log_text += f"Return code: {result.returncode}\n\n"
+        log_text += "===== STDOUT =====\n"
+        log_text += result.stdout
+        log_text += "\n\n===== STDERR =====\n"
+        log_text += result.stderr
+
+        log_file.write_text(log_text, encoding="utf-8")
+
+        copied = copy_latest_clean_csv_to_gadgets()
+        data = get_data(force_reload=True)
+
+        if result.returncode == 0:
+            write_scraper_status(
+                status="success",
+                message=f"Scraping completed. gadgets.csv updated: {copied}. Dataset refreshed. Rows: {len(data)}.",
+                log_file=log_file,
+                started_at=started_at,
+                finished_at=finished_at,
+                return_code=result.returncode
+            )
+        else:
+            write_scraper_status(
+                status="failed",
+                message="Scraper finished with error. Check logs.",
+                log_file=log_file,
+                started_at=started_at,
+                finished_at=finished_at,
+                return_code=result.returncode
+            )
+
+    except Exception as e:
+        finished_at = datetime.now()
+
+        try:
+            log_file.write_text(str(e), encoding="utf-8")
+        except Exception:
+            pass
+
+        write_scraper_status(
+            status="error",
+            message=str(e),
+            log_file=log_file,
+            started_at=started_at,
+            finished_at=finished_at
+        )
+
+    finally:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
 
 
 # =====================================================
@@ -1356,16 +1475,48 @@ def serve_gadget_image(filename):
     return send_from_directory(IMAGE_FOLDER, filename)
 
 
+@app.route("/status", methods=["GET"])
+def scraper_status():
+    return jsonify(read_scraper_status())
+
+
+@app.route("/run-scraper", methods=["GET", "POST"])
+def run_scraper():
+    if LOCK_FILE.exists():
+        return jsonify({
+            "status": "busy",
+            "message": "Scraper is already running. Please wait.",
+            "status_endpoint": "/status"
+        }), 409
+
+    if not SCRAPER_PATH.exists():
+        return jsonify({
+            "status": "error",
+            "message": "scrape_gadgets.py not found.",
+            "expected_path": str(SCRAPER_PATH)
+        }), 404
+
+    thread = threading.Thread(target=run_scraper_background)
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({
+        "status": "started",
+        "message": "Scraper started in the background.",
+        "status_endpoint": "/status"
+    }), 202
+
+
 @app.route("/refresh-data", methods=["GET", "POST"])
 def refresh_data():
     data = get_data(force_reload=True)
 
-    return {
+    return jsonify({
         "status": "success",
         "message": "Dataset refreshed successfully.",
         "rows": int(len(data)),
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
+    })
 
 
 @app.route("/")
