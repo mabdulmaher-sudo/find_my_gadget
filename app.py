@@ -9,6 +9,7 @@ import threading
 import sys
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import quote
 
 import pandas as pd
 from flask import Flask, request, render_template_string, send_from_directory, url_for, jsonify
@@ -230,7 +231,33 @@ def make_link(row):
     return f"https://www.google.com/search?q={query}"
 
 
+def default_category_image(category):
+    """
+    Returns a local default image based on the gadget category.
+    The files must be stored inside the gadget_images folder:
+      - default_phone.jpg
+      - default_laptop.jpg
+      - default_tablet.jpg
+    """
+    category = normalize_category(category)
+
+    default_files = {
+        "Smartphone": "default_phone.jpg",
+        "Laptop": "default_laptop.jpg",
+        "Tablet": "default_tablet.jpg",
+    }
+
+    filename = default_files.get(category, "default_phone.jpg")
+    return url_for("serve_gadget_image", filename=filename)
+
+
 def get_image(row):
+    """
+    Image priority:
+    1. Real online image_url
+    2. Local image_file from gadget_images
+    3. Default category image supplied by the user
+    """
     image_url = clean_text(row.get("image_url", ""))
 
     if image_url.startswith("http://") or image_url.startswith("https://"):
@@ -238,20 +265,21 @@ def get_image(row):
 
     image_file = clean_text(row.get("image_file", ""))
 
-    if not image_file:
-        return ""
+    if image_file:
+        normalized = image_file.replace("\\", "/")
 
-    normalized = image_file.replace("\\", "/")
+        if "gadget_images/" in normalized:
+            filename = normalized.split("gadget_images/", 1)[1]
+        else:
+            filename = os.path.basename(normalized)
 
-    if "gadget_images/" in normalized:
-        filename = normalized.split("gadget_images/", 1)[1]
-    else:
-        filename = os.path.basename(normalized)
+        if filename:
+            local_path = os.path.join(IMAGE_FOLDER, filename)
 
-    if filename:
-        return url_for("serve_gadget_image", filename=filename)
+            if os.path.exists(local_path):
+                return url_for("serve_gadget_image", filename=filename)
 
-    return ""
+    return default_category_image(row.get("category", "Gadget"))
 
 
 # =====================================================
@@ -276,13 +304,15 @@ def build_category_guides(df):
     valid_df = valid_df[valid_df["price"] > 0]
 
     def make_guide(label, sub_df):
+        display_label = "Phones" if label == "Smartphone" else label
+
         if sub_df.empty:
             return {
-                "label": label,
+                "label": display_label,
                 "min_price": 0,
                 "max_price": 0,
                 "count": 0,
-                "instruction": f"No available {label} data in the dataset."
+                "instruction": f"No available {display_label} data in the dataset."
             }
 
         min_price = float(sub_df["price"].min())
@@ -290,11 +320,11 @@ def build_category_guides(df):
         count = int(len(sub_df))
 
         return {
-            "label": label,
+            "label": display_label,
             "min_price": min_price,
             "max_price": max_price,
             "count": count,
-            "instruction": f"For {label}, enter a budget between {money(min_price)} and {money(max_price)} based on the current dataset. Available records: {count}."
+            "instruction": f"For {display_label}, enter a budget between {money(min_price)} and {money(max_price)} based on the current dataset. Available records: {count}."
         }
 
     guides["All"] = make_guide("All Gadgets", valid_df)
@@ -851,6 +881,7 @@ def to_card(row, match_score=None):
         "price": float(price) if price is not None and not pd.isna(price) else None,
         "price_display": money(price),
         "image": get_image(row),
+        "fallback_image": default_category_image(row.get("category", "Gadget")),
         "link": make_link(row),
         "features": features[:6],
         "match_score": round(float(match_score), 1) if match_score is not None else None,
@@ -898,11 +929,27 @@ def recommend(budget, category, usage):
         scores.append(final)
 
     df["match_score"] = scores
+
+    # Sorting rule for Suggestions:
+    # 1. First result = exact budget match; if none, closest price to the user's budget.
+    # 2. Remaining results = ascending percentage above the user's budget.
+    #    Example: +0.5% appears before +2%, and +2% appears before +5%.
     df["price_distance"] = (df["price"] - budget).abs()
+    df["above_budget_percent"] = ((df["price"] - budget) / budget * 100).clip(lower=0)
+    df["distance_percent"] = (df["price_distance"] / budget * 100)
+
+    df["is_budget_best_match"] = False
+    closest_index = df["price_distance"].idxmin()
+    df.loc[closest_index, "is_budget_best_match"] = True
 
     df = df.sort_values(
-        ["match_score", "price_distance"],
-        ascending=[False, True]
+        [
+            "is_budget_best_match",
+            "above_budget_percent",
+            "distance_percent",
+            "match_score"
+        ],
+        ascending=[False, True, True, False]
     )
 
     return [to_card(row, row["match_score"]) for _, row in df.iterrows()]
@@ -934,7 +981,7 @@ body{
     background:
         repeating-linear-gradient(0deg, rgba(255,255,255,.08) 0 1px, transparent 1px 75px),
         repeating-linear-gradient(90deg, rgba(255,255,255,.08) 0 1px, transparent 1px 75px),
-        linear-gradient(135deg, #8b0000 0%, #c1121f 35%, #001d5c 72%, #020617 100%);
+        linear-gradient(135deg, #008b64 0%, #12c1b8 35%, #001d5c 72%, #020617 100%);
     background-attachment:fixed;
 }
 
@@ -957,7 +1004,7 @@ body{
     font-size:30px;
     font-weight:900;
     color:white;
-    text-shadow:3px 3px 0 #b00020, 0 0 15px rgba(255,0,0,.7);
+    text-shadow:3px 3px 0 #008ab0, 0 0 15px rgba(0, 255, 85, 0.7);
 }
 
 .brand p{
@@ -975,7 +1022,7 @@ body{
 }
 
 .sidebar{
-    background:linear-gradient(160deg, rgba(193,18,31,.88), rgba(0,29,92,.90));
+    background:linear-gradient(160deg, rgba(18, 155, 193, 0.88), rgba(0,29,92,.90));
     border:1px solid rgba(255,255,255,.25);
     border-radius:16px;
     padding:26px 24px;
@@ -1084,7 +1131,7 @@ input[type="range"]{
 }
 
 .content-head{
-    background:linear-gradient(135deg, rgba(193,18,31,.95), rgba(0,29,92,.95));
+    background:linear-gradient(135deg, rgba(94, 193, 18, 0.95), rgba(0,29,92,.95));
     border-left:8px solid #ffffff;
     border-radius:14px;
     padding:20px;
@@ -1140,7 +1187,7 @@ input[type="range"]{
 .img-box img{
     width:100%;
     height:100%;
-    object-fit:contain;
+    object-fit:cover;
     background:white;
 }
 
@@ -1165,7 +1212,7 @@ input[type="range"]{
 }
 
 .badge{
-    background:#c1121f;
+    background:#1298c1;
     border:1px solid rgba(255,255,255,.25);
     padding:6px 9px;
     border-radius:999px;
@@ -1269,24 +1316,23 @@ input[type="range"]{
             <div class="form-group">
                 <label>1. Enter Budget</label>
                 <input type="text" id="budgetInput" name="budget" value="{{ budget_input }}" placeholder="Example: 10000 or 10k">
-                <div class="hint">
-                    Accepted range: {{ lower_display }} to {{ upper_display }}<br>
-                    Rule: 0.1% pababa and 5% pataas only.
-                </div>
+            
 
                 <input type="range" id="budgetRange" min="500" max="500000" value="{{ budget_value }}">
                 <div class="range-row">
-                    <span>Min: ₱500</span>
-                    <span>Max: ₱500,000</span>
+                    <span id="guideMin">Min: ₱0</span>
+                    <span id="guideMax">Max: ₱0</span>
                 </div>
             </div>
 
             <div class="form-group">
                 <label>2. Select Gadget Type</label>
                 <select name="category" id="categorySelect">
-                    <option value="All" {% if category == "All" %}selected{% endif %}>All</option>
+                    <option value="All" {% if category == "All" %}selected{% endif %}>All Gadgets</option>
                     {% for cat in categories %}
-                        <option value="{{ cat }}" {% if cat == category %}selected{% endif %}>{{ cat }}</option>
+                        <option value="{{ cat }}" {% if cat == category %}selected{% endif %}>
+                            {% if cat == "Smartphone" %}Phone{% else %}{{ cat }}{% endif %}
+                        </option>
                     {% endfor %}
                 </select>
 
@@ -1333,11 +1379,11 @@ input[type="range"]{
             {% for item in results %}
             <article class="card">
                 <div class="img-box">
-                    {% if item.image %}
-                        <img src="{{ item.image }}" alt="{{ item.brand }} {{ item.model }}">
-                    {% else %}
-                        <div class="no-img">No Image Available</div>
-                    {% endif %}
+                    <img
+                        src="{{ item.image }}"
+                        alt="{{ item.brand }} {{ item.model }}"
+                        onerror="this.onerror=null; this.src='{{ item.fallback_image }}';"
+                    >
                 </div>
 
                 <h3>{{ item.brand }} {{ item.model }}</h3>
@@ -1366,8 +1412,7 @@ input[type="range"]{
         {% else %}
             <div class="empty">
                 No matching gadgets found within the allowed price range.<br><br>
-                Try another budget. Example: if budget is ₱10,000, the system only allows ₱9,990 to ₱10,500.
-            </div>
+                Try another budget.   </div>
         {% endif %}
     </section>
 </main>
@@ -1377,6 +1422,8 @@ const budgetInput = document.getElementById("budgetInput");
 const budgetRange = document.getElementById("budgetRange");
 const categorySelect = document.getElementById("categorySelect");
 const categoryGuide = document.getElementById("categoryGuide");
+const guideMin = document.getElementById("guideMin");
+const guideMax = document.getElementById("guideMax");
 
 const CATEGORY_GUIDES = {{ category_guides|tojson }};
 
@@ -1417,6 +1464,8 @@ function updateCategoryInstruction(){
 
     if(!guide){
         categoryGuide.innerHTML = "No price guide available.";
+        guideMin.textContent = "Min: ₱0";
+        guideMax.textContent = "Max: ₱0";
         return;
     }
 
@@ -1425,11 +1474,31 @@ function updateCategoryInstruction(){
             <b>${guide.label}</b><br>
             No available price data for this category.
         `;
+        guideMin.textContent = "Min: ₱0";
+        guideMax.textContent = "Max: ₱0";
         return;
     }
 
     let minPrice = Number(guide.min_price);
     let maxPrice = Number(guide.max_price);
+
+    guideMin.textContent = "Min: " + peso(minPrice);
+    guideMax.textContent = "Max: " + peso(maxPrice);
+
+    budgetRange.min = Math.floor(minPrice);
+    budgetRange.max = Math.ceil(maxPrice);
+
+    let currentBudget = parseBudgetText(budgetInput.value);
+
+    if(!isNaN(currentBudget)){
+        if(currentBudget < minPrice){
+            budgetRange.value = Math.floor(minPrice);
+        }else if(currentBudget > maxPrice){
+            budgetRange.value = Math.ceil(maxPrice);
+        }else{
+            budgetRange.value = Math.round(currentBudget);
+        }
+    }
 
     categoryGuide.innerHTML = `
         <b>${guide.label} Price Guide</b><br>
@@ -1444,8 +1513,10 @@ function updateCategoryInstruction(){
 
 budgetInput.addEventListener("input", function(){
     let value = parseBudgetText(budgetInput.value);
+    let minValue = Number(budgetRange.min);
+    let maxValue = Number(budgetRange.max);
 
-    if(value >= 500 && value <= 500000){
+    if(value >= minValue && value <= maxValue){
         budgetRange.value = value;
     }
 });
@@ -1524,6 +1595,9 @@ def index():
     budget_input = request.args.get("budget", "10000")
     category = request.args.get("category", "Smartphone")
     usage = request.args.get("usage", "All")
+
+    if clean_text(category).lower() in ["phone", "phones", "smartphone", "smartphones"]:
+        category = "Smartphone"
 
     budget_value = parse_budget_input(budget_input)
 
